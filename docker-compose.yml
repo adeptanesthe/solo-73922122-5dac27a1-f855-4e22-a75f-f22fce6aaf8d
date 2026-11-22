@@ -1,0 +1,21 @@
+services:
+  conformal-api:
+    build: .
+    image: battery-conformal-api:1.0.0
+    container_name: battery-conformal-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - calibration-data:/data
+    environment:
+      CALIBRATION_STATE_FILE: /data/calibration_state.json
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  calibration-data:
