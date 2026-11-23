@@ -1,11 +1,18 @@
-"""Conformal 阈值计算与预测集合 / 复测区间生成（NumPy 实现）。"""
+"""Conformal 阈值计算与预测集合 / 复测区间生成。
+
+校准阈值采用与 NumPy ``np.quantile(..., method="linear")`` 等价的线性
+插值分位数。为避免在校准批次之外再保存一份故障分数，本模块对整个批次
+做多轮流式扫描，用固定大小的直方图逐步缩小取值区间，直到定位到所需的
+次序统计量。额外工作内存只与故障类型数（以及固定的直方图桶数）有关，
+不随校准窗口数增长。
+"""
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Sequence, Tuple
-
-import numpy as np
+import struct
+from array import array
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .schemas import NORMAL_LABEL
 
@@ -23,6 +30,119 @@ def _finite_float(value: object) -> float:
     if not math.isfinite(f):
         raise CalibrationValidationError(f"分数必须为有限数值，收到 {value!r}")
     return f
+
+
+# ---------------------------------------------------------------------- #
+# 浮点数 <-> 全序 uint64 键：键序与浮点数大小顺序一致，便于按值域分桶。
+# 只处理有限 float64；-0.0 与 +0.0 的键不同，但数值比较语义相同。
+# ---------------------------------------------------------------------- #
+_KEY_SIGN = 1 << 63
+_KEY_MASK = (1 << 64) - 1
+_HIST_BITS = 12
+_HIST_BUCKETS = 1 << _HIST_BITS
+_HIST_MASK = _HIST_BUCKETS - 1
+
+
+def _float_to_key(value: float) -> int:
+    bits = struct.unpack("<Q", struct.pack("<d", value))[0]
+    if bits & _KEY_SIGN:
+        return (~bits) & _KEY_MASK
+    return bits | _KEY_SIGN
+
+
+def _key_to_float(key: int) -> float:
+    if key & _KEY_SIGN:
+        bits = key & (_KEY_MASK >> 1)
+    else:
+        bits = (~key) & _KEY_MASK
+    return struct.unpack("<d", struct.pack("<Q", bits))[0]
+
+
+def _lerp(a: float, b: float, gamma: float) -> float:
+    """与 NumPy ``_lerp`` 相同的浮点运算顺序，保证逐位一致。"""
+    diff = b - a
+    if gamma >= 0.5:
+        return b - diff * (1.0 - gamma)
+    return a + diff * gamma
+
+
+class _ClassSelector:
+    """某个故障类型的待选次序统计量集合。
+
+    ``targets`` 中每一项为 ``[lo, hi, pos]``：在键区间 ``[lo, hi]`` 内
+    仍未定位的第 ``pos`` 个样本（相对该区间内全部样本的 0 基排名）。
+    """
+
+    __slots__ = ("min_key", "max_key", "targets")
+
+    def __init__(self) -> None:
+        self.min_key: Optional[int] = None
+        self.max_key: Optional[int] = None
+        self.targets: List[List[int]] = []
+
+
+def _select_order_statistics(
+    windows: Sequence, selectors: Dict[str, _ClassSelector]
+) -> None:
+    """多轮流式分桶，把每个 selector 的目标排名定位到具体浮点键。
+
+    每一轮只扫描一遍已解析的窗口、只读取窗口上的分数（不复制、不缓存），
+    并用大小固定的直方图缩小候选区间。最坏经过 ceil(64 / _HIST_BITS) 轮
+    即可把区间缩到单一键。
+    """
+    active = {}
+    for label, selector in selectors.items():
+        if any(target[0] != target[1] for target in selector.targets):
+            active[label] = selector
+
+    while active:
+        plans: Dict[str, List[Tuple[int, int, int, array, List[List[int]]]]] = {}
+        for label, selector in active.items():
+            by_range: Dict[Tuple[int, int], List[List[int]]] = {}
+            for target in selector.targets:
+                if target[0] == target[1]:
+                    continue
+                by_range.setdefault((target[0], target[1]), []).append(target)
+            plan: List[Tuple[int, int, int, array, List[List[int]]]] = []
+            for (lo, hi), targets in by_range.items():
+                width = (hi - lo + _HIST_MASK + 1) // _HIST_BUCKETS
+                hist = array("Q", [0]) * _HIST_BUCKETS
+                plan.append((lo, hi, width, hist, targets))
+            plans[label] = plan
+
+        # 单遍扫描：每个窗口只贡献它自己故障标签对应分数的一次计数
+        for window in windows:
+            plan = plans.get(window.label)
+            if not plan:
+                continue
+            label = window.label
+            key = _float_to_key(float(window.scores[label]))
+            for lo, hi, width, hist, _targets in plan:
+                if lo <= key <= hi:
+                    hist[(key - lo) // width] += 1
+
+        for plan in plans.values():
+            for lo, hi, width, hist, targets in plan:
+                for target in targets:
+                    position = target[2]
+                    cumulative = 0
+                    for bucket in range(_HIST_BUCKETS):
+                        count = hist[bucket]
+                        if count and cumulative + count > position:
+                            target[0] = lo + bucket * width
+                            target[1] = min(hi, lo + (bucket + 1) * width - 1)
+                            target[2] = position - cumulative
+                            break
+                        cumulative += count
+                    else:  # pragma: no cover - 只可能在内部状态被破坏时触发
+                        raise RuntimeError(
+                            "流式分位数定位失败：目标排名不在候选区间内"
+                        )
+
+        active = {}
+        for label, selector in selectors.items():
+            if any(target[0] != target[1] for target in selector.targets):
+                active[label] = selector
 
 
 def validate_and_build_thresholds(
@@ -49,6 +169,11 @@ def validate_and_build_thresholds(
     ``q_{ceil((n+1)*(1-alpha)) / n}``，映射回原分数即
     ``rank = ceil((n+1)*alpha) / n``，对 s 取该 rank 的线性插值分位数。
     该校正保证故障窗口被预测集合覆盖的边际比例 >= 1-alpha。
+
+    实现上不保留任何按故障类型聚合的分数副本：第一遍流式校验并统计
+    各类型的样本数、最小值/最大值键，第二段用固定 4096 桶的直方图
+    多轮扫描定位分位点两侧的次序统计量，再按 NumPy ``linear`` 方法的
+    运算顺序做线性插值。重复分数按出现次数正常计数。
     """
     if not 0.0 < alpha < 1.0:
         raise CalibrationValidationError("alpha 必须位于 (0, 1) 开区间内")
@@ -62,10 +187,13 @@ def validate_and_build_thresholds(
     fault_set = set(fault_list)
     n = len(windows)
     normal_count = 0
-    # fault type -> 该类型故障窗口上的对应分数
-    fault_scores: Dict[str, List[float]] = {ft: [] for ft in fault_list}
+    # 每个故障类型只维护常数大小的统计量：样本数与值域键边界
+    selectors: Dict[str, _ClassSelector] = {
+        ft: _ClassSelector() for ft in fault_list
+    }
+    counts: Dict[str, int] = {ft: 0 for ft in fault_list}
 
-    prev_ts: float | None = None
+    prev_ts: Optional[float] = None
     for i, w in enumerate(windows):
         ts = _finite_float(w.timestamp)
         if prev_ts is not None and ts <= prev_ts:
@@ -91,26 +219,66 @@ def validate_and_build_thresholds(
         for ft in fault_list:
             value = _finite_float(score_map[ft])
             if label == ft:
-                fault_scores[ft].append(value)
+                key = _float_to_key(value)
+                counts[ft] += 1
+                selector = selectors[ft]
+                if selector.min_key is None or key < selector.min_key:
+                    selector.min_key = key
+                if selector.max_key is None or key > selector.max_key:
+                    selector.max_key = key
 
     missing_classes = [
-        ft for ft in fault_list if len(fault_scores[ft]) < min_samples_per_fault
+        ft for ft in fault_list if counts[ft] < min_samples_per_fault
     ]
     if missing_classes:
         detail = ", ".join(
-            f"{ft}(仅 {len(fault_scores[ft])} 个样本，要求 >= {min_samples_per_fault})"
+            f"{ft}(仅 {counts[ft]} 个样本，要求 >= {min_samples_per_fault})"
             for ft in missing_classes
         )
         raise CalibrationValidationError(f"故障类型样本覆盖不足: {detail}")
 
     threshold_info: Dict[str, Tuple[float, int, float]] = {}
+    ranks: Dict[str, float] = {}
     for ft in fault_list:
-        values = np.asarray(fault_scores[ft], dtype=np.float64)
-        m = values.size
+        m = counts[ft]
+        if m == 0:
+            raise CalibrationValidationError(
+                f"故障类型 {ft!r} 没有故障样本，无法计算阈值"
+            )
         # 分数越高越像故障：对非一致性分数 -s 取 (1-alpha) 分位等价于
         # 对 s 取 rank = ceil((n+1)*alpha)/n 的低分位（截顶到 [1/n, 1]）
         rank = min(1.0, math.ceil((m + 1) * alpha) / m)
-        threshold = float(np.quantile(values, rank, method="linear"))
+        ranks[ft] = rank
+        virtual = (m - 1) * rank
+        # NumPy 对 virtual >= m-1 的情形直接取最大值（previous/next 均为 -1）
+        if virtual < m - 1:
+            selector = selectors[ft]
+            lower_index = math.floor(virtual)
+            # 两侧次序统计量；相同区间共享同一张直方图
+            for position in (lower_index, lower_index + 1):
+                selector.targets.append(
+                    [selector.min_key, selector.max_key, position]  # type: ignore[list-item]
+                )
+
+    _select_order_statistics(windows, selectors)
+
+    for ft in fault_list:
+        m = counts[ft]
+        rank = ranks[ft]
+        selector = selectors[ft]
+        if (m - 1) * rank >= m - 1:
+            # 与 NumPy 一致：虚拟索引达到上界时直接取最大值本身
+            threshold = _key_to_float(selector.max_key)  # type: ignore[arg-type]
+        else:
+            virtual = (m - 1) * rank
+            lower_index = math.floor(virtual)
+            gamma = virtual - lower_index
+            lower_key, upper_key = (
+                target[0] for target in selector.targets
+            )
+            threshold = _lerp(
+                _key_to_float(lower_key), _key_to_float(upper_key), gamma
+            )
         threshold_info[ft] = (threshold, m, rank)
 
     return threshold_info, normal_count, n - normal_count

@@ -22,17 +22,27 @@ class VersionAlreadyExistsError(ValueError):
     """校准版本号重复。"""
 
 
+class SnapshotWriteError(RuntimeError):
+    """校准快照落盘失败；本次发布已放弃，内存版本库未改动。"""
+
+
 class CalibrationStore:
     """内存版本库 + 原子 JSON 快照。
 
-    发布流程保证原子性：先在锁外完成全部校验与阈值计算，拿到完整的
-    新版本对象后才进入临界区；临界区内只做指针切换和一次
-    ``os.replace`` 原子落盘。任何一步失败，活动版本与磁盘快照都保持
-    在上一版状态。
+    发布流程保证原子性，并尽量缩短对读请求的阻塞：
+
+    1. 调用方在锁外完成全部校验与阈值计算；
+    2. 发布者之间用 ``_publish_lock`` 串行化；持锁快照版本表后**不持有
+       读锁**写临时快照并 ``fsync``，此间检测/查询线程仍可读取已发布版本；
+    3. 落盘只在临时文件上完成，``os.replace`` 原子替换正式快照后，再在
+       读锁内一次性登记新版本、切换活动指针；
+    4. 任一步失败都会清理临时文件，内存与磁盘都保持在最近一次成功发布
+       的状态，新版本对查询与检测完全不可见。
     """
 
     def __init__(self, snapshot_path: Optional[str] = None) -> None:
         self._lock = threading.RLock()
+        self._publish_lock = threading.Lock()
         self._versions: Dict[str, CalibrationResult] = {}
         self._active_version: Optional[str] = None
         self._snapshot_path = snapshot_path or os.environ.get(
@@ -63,30 +73,69 @@ class CalibrationStore:
             # 快照损坏不阻断启动，但丢弃该快照，后续发布会覆盖它
             print(f"[store] 警告：无法加载校准快照 {path}: {exc}")
 
-    def _persist_locked(self) -> None:
-        path = self._snapshot_path
-        if not path:
-            return
-        directory = os.path.dirname(os.path.abspath(path))
-        os.makedirs(directory, exist_ok=True)
-        payload = {
-            "active_version": self._active_version,
+    @staticmethod
+    def _snapshot_payload(
+        versions: Dict[str, CalibrationResult], active: Optional[str]
+    ) -> dict:
+        return {
+            "active_version": active,
             "versions": {
-                version: result.model_dump() for version, result in self._versions.items()
+                version: result.model_dump()
+                for version, result in versions.items()
             },
         }
-        # 同目录临时文件 + os.replace，保证落盘原子性
-        fd, tmp_path = tempfile.mkstemp(prefix=".cal-", suffix=".tmp", dir=directory)
+
+    def _stage_snapshot(
+        self, versions: Dict[str, CalibrationResult], active: Optional[str]
+    ) -> Optional[str]:
+        """把版本表写入临时快照文件（不替换正式快照），返回临时文件路径。
+
+        未启用持久化时返回 ``None``。失败时清理临时文件并抛出
+        ``SnapshotWriteError``。
+        """
+        path = self._snapshot_path
+        if not path:
+            return None
+        payload = self._snapshot_payload(versions, active)
+        directory = os.path.dirname(os.path.abspath(path))
+        try:
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".cal-", suffix=".tmp", dir=directory
+            )
+        except OSError as exc:
+            raise SnapshotWriteError(f"无法准备校准快照临时文件: {exc}") from exc
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False)
                 fh.flush()
                 os.fsync(fh.fileno())
+        except BaseException as exc:
+            self._discard_staged(tmp_path)
+            raise SnapshotWriteError(f"写入校准快照失败: {exc}") from exc
+        return tmp_path
+
+    def _discard_staged(self, tmp_path: Optional[str]) -> None:
+        """删除本批次留下的临时快照文件（不存在或已替换则忽略）。"""
+        if not tmp_path:
+            return
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # 清理失败不应掩盖发布结果；残留文件形如 .cal-*.tmp，不会被读取
+            pass
+
+    def _commit_staged(self, tmp_path: Optional[str]) -> None:
+        path = self._snapshot_path
+        if not tmp_path or not path:
+            return
+        try:
             os.replace(tmp_path, path)
-        except BaseException:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            raise
+        except OSError as exc:
+            self._discard_staged(tmp_path)
+            raise SnapshotWriteError(f"替换校准快照失败: {exc}") from exc
 
     # ------------------------------------------------------------------ #
     # 发布 / 查询
@@ -94,18 +143,36 @@ class CalibrationStore:
     def publish(self, result: CalibrationResult, *, activate: bool = True) -> None:
         """原子发布一个已构建完成的校准结果。
 
-        调用方必须先完成全部校验；本方法只负责临界区内的版本切换。
-        版本号冲突时拒绝发布，现有版本与活动指针不受影响。
+        调用方必须先完成全部校验与阈值计算。本方法先落盘、后登记：只有
+        新快照原子替换成功之后，新版本才会出现在版本表并成为活动版本。
+        版本号冲突或落盘失败时，现有版本、活动指针与磁盘快照都不受影响
+        （临时快照文件会被清理）。
         """
-        with self._lock:
-            if result.version in self._versions:
-                raise VersionAlreadyExistsError(
-                    f"校准版本 {result.version!r} 已存在，拒绝重复发布"
-                )
-            self._versions[result.version] = result
-            if activate or self._active_version is None:
-                self._active_version = result.version
-            self._persist_locked()
+        with self._publish_lock:  # 发布者串行；读请求不需要此锁
+            with self._lock:
+                if result.version in self._versions:
+                    raise VersionAlreadyExistsError(
+                        f"校准版本 {result.version!r} 已存在，拒绝重复发布"
+                    )
+                previous_active = self._active_version
+                # 只复制版本表引用（浅拷贝），不复制每个结果对象
+                candidate_versions = dict(self._versions)
+            candidate_active = (
+                result.version
+                if activate or previous_active is None
+                else previous_active
+            )
+            candidate_versions[result.version] = result
+
+            # 落盘期间不持有读锁：并发检测仍使用上一版活动版本
+            staged = self._stage_snapshot(candidate_versions, candidate_active)
+            self._commit_staged(staged)
+
+            # 快照已原子替换成功，才在锁内一次性生效；版本号冲突在进入
+            # 落盘前已由本锁 + 发布锁排除，此处不会出现半发布状态
+            with self._lock:
+                self._versions[result.version] = result
+                self._active_version = candidate_active
 
     def get(self, version: str) -> CalibrationResult:
         with self._lock:

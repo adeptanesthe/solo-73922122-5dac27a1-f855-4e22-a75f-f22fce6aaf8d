@@ -26,7 +26,12 @@ from .schemas import (
     VersionSummary,
     WindowPrediction,
 )
-from .store import CalibrationStore, VersionAlreadyExistsError, VersionNotFoundError
+from .store import (
+    CalibrationStore,
+    SnapshotWriteError,
+    VersionAlreadyExistsError,
+    VersionNotFoundError,
+)
 
 app = FastAPI(
     title="电芯故障 conformal 检测服务",
@@ -66,6 +71,19 @@ async def version_exists_handler(
         retained_version=store.active_version,
     )
     return JSONResponse(status_code=409, content=body.model_dump())
+
+
+@app.exception_handler(SnapshotWriteError)
+async def snapshot_write_handler(
+    request: Request, exc: SnapshotWriteError
+) -> JSONResponse:
+    body = CalibrationError(
+        reason="校准快照落盘失败，本批次临时数据已清理，未发布新版本，"
+        "继续保留最近一次成功发布的校准结果",
+        detail=str(exc),
+        retained_version=store.active_version,
+    )
+    return JSONResponse(status_code=500, content=body.model_dump())
 
 
 @app.get("/health")
